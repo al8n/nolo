@@ -1,10 +1,10 @@
 [package]
-name = "template-rs"
+name = "nolo"
 version = "0.1.6"
 edition = "2021"
-repository = "https://github.com/al8n/template-rs"
-homepage = "https://github.com/al8n/template-rs"
-documentation = "https://docs.rs/template-rs"
+repository = "https://github.com/al8n/nolo"
+homepage = "https://github.com/al8n/nolo"
+documentation = "https://docs.rs/nolo"
 description = "A template for creating Rust open-source repo on GitHub"
 license = "MIT/Apache-2.0"
 rust-version = "1.73"
@@ -17,9 +17,15 @@ harness = false
 [features]
 default = ["std"]
 alloc = []
-std = []
+std = ["crossbeam-utils/default"]
 
 [dependencies]
+crossbeam-utils = { version = "0.8", default-features = false }
+crossbeam-epoch = { version = "0.9", default-features = false }
+
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
 
 [dev-dependencies]
 criterion = "0.5"

@@ -3,27 +3,25 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(docsrs, allow(unused_attributes))]
 #![deny(missing_docs)]
+#![allow(unexpected_cfgs)]
 
-#[cfg(all(not(feature = "std"), feature = "alloc"))]
+#[cfg(not(feature = "std"))]
 extern crate alloc as std;
 
-#[cfg(all(feature = "std", not(feature = "alloc")))]
+#[cfg(feature = "std")]
 extern crate std;
 
-#[cfg(all(feature = "std", feature = "alloc"))]
-extern crate std;
+/// Lock free linked list
+#[cfg(any(feature = "alloc", feature = "std"))]
+pub mod linked_list;
 
-/// template
-pub fn it_works() -> usize {
-  4
-}
+pub(crate) mod utils;
+use utils::*;
 
-#[cfg(test)]
-mod tests {
-  use super::*;
+mod sync {
+  #[cfg(loom)]
+  pub(crate) use loom::sync::{atomic::*, *};
 
-  #[test]
-  fn test_works() {
-    assert_eq!(it_works(), 4);
-  }
+  #[cfg(not(loom))]
+  pub(crate) use std::sync::{atomic::*, *};
 }
