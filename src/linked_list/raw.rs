@@ -315,7 +315,7 @@ impl<'a, T> RefNode<'a, T> {
           guard,
         };
 
-        if let Some(e) = RefNode::try_acquire(self.parent, &n.node) {
+        if let Some(e) = RefNode::try_acquire(self.parent, n.node) {
           return Some(e);
         }
       }
@@ -518,6 +518,7 @@ impl<T> RawLinkedList<T> {
           continue;
         }
 
+        self.len.fetch_add(1, Ordering::Relaxed);
         return RefNode {
           parent: self,
           node: new_node.deref(),
@@ -614,8 +615,6 @@ impl<T> RawLinkedList<T> {
       assert!(c == &self.collector);
     }
   }
-
-  // fn help_unlink(&self, )
 }
 
 impl<T: PartialEq> RawLinkedList<T> {
@@ -678,19 +677,6 @@ impl<T> Drop for RawLinkedList<T> {
 
         node = next;
       }
-    }
-  }
-}
-
-/// Helper function to retry an operation until pinning succeeds or `None` is
-/// returned.
-pub(super) fn try_pin_loop<'a: 'g, 'g, F, T>(mut f: F) -> Option<RefNode<'a, T>>
-where
-  F: FnMut() -> Option<Node<'a, 'g, T>>,
-{
-  loop {
-    if let Some(e) = f()?.pin() {
-      return Some(e);
     }
   }
 }

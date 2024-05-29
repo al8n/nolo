@@ -16,10 +16,6 @@ pub use crossbeam_epoch::{default_collector, is_pinned, pin};
 
 use crossbeam_epoch as epoch;
 
-/// Lock free doubly linked list, if you only need a singly linked list, see [`linked_list`] instead.
-#[cfg(any(feature = "alloc", feature = "std"))]
-pub mod doubly_linked_list;
-
 /// Lock free linked list, if you need a doubly linked list, see [`doubly_linked_list`] instead.
 ///
 /// The linked list implementation is based on the [A Pragmatic Implementation of Non-Blocking Linked-Lists](https://www.cl.cam.ac.uk/research/srg/netos/papers/2001-caslists.pdf).

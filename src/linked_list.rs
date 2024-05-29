@@ -8,6 +8,7 @@ pub mod raw;
 /// A lock-free linked list.
 ///
 /// The linked list implementation is based on the [A Pragmatic Implementation of Non-Blocking Linked-Lists](https://www.cl.cam.ac.uk/research/srg/netos/papers/2001-caslists.pdf).
+#[repr(transparent)]
 pub struct LinkedList<T> {
   raw: raw::RawLinkedList<T>,
 }
