@@ -1,10 +1,9 @@
 use core::{
-  fmt,
   mem::{self, MaybeUninit},
   ptr,
 };
 
-use crossbeam_epoch::{Atomic, Collector, Guard, Owned};
+use crossbeam_epoch::{Atomic, Collector, Guard, Owned, Shared};
 use crossbeam_utils::Backoff;
 
 use super::sync::*;
@@ -19,10 +18,10 @@ struct Ref<T> {
 
 impl<T> Ref<T> {
   #[inline]
-  fn new(value: T, refs: usize) -> Self {
+  fn new(value: T) -> Self {
     Self {
       value,
-      refs: AtomicUsize::new(refs),
+      refs: AtomicUsize::new(1),
     }
   }
 }
@@ -33,20 +32,24 @@ struct RawNode<T> {
 
   /// The next node in the linked list
   next: Atomic<RawNode<T>>,
+  /// The previous node in the linked list
+  prev: Atomic<RawNode<T>>,
 }
 
 impl<T> RawNode<T> {
   const UNINIT: Self = Self {
     value: MaybeUninit::uninit(),
     next: Atomic::null(),
+    prev: Atomic::null(),
   };
 
   /// Create a new node
   #[inline]
-  fn new(value: T, refs: usize) -> Self {
+  fn new(value: T) -> Self {
     RawNode {
-      value: MaybeUninit::new(Ref::new(value, refs)),
+      value: MaybeUninit::new(Ref::new(value)),
       next: Atomic::null(),
+      prev: Atomic::null(),
     }
   }
 
@@ -193,6 +196,40 @@ impl<'a: 'g, 'g, T> Node<'a, 'g, T> {
     }
   }
 
+  /// Moves to the prev node in the linked list.
+  pub fn move_prev(&mut self) -> bool {
+    match self.prev() {
+      None => false,
+      Some(n) => {
+        *self = n;
+        true
+      }
+    }
+  }
+
+  /// Returns the previous node in the linked list.
+  pub fn prev(&self) -> Option<Node<'a, 'g, T>> {
+    let backoff = Backoff::new();
+    loop {
+      let prev = self.node.prev.load_consume(self.guard);
+
+      if prev.is_null() {
+        return None;
+      }
+
+      if prev.tag() == 1 {
+        backoff.snooze();
+        continue;
+      }
+
+      return Some(Node {
+        parent: self.parent,
+        node: unsafe { prev.deref() },
+        guard: self.guard,
+      });
+    }
+  }
+
   /// Attempts to pin the node with a reference count, ensuring that it
   /// remains accessible even after the `Guard` is dropped.
   ///
@@ -203,7 +240,7 @@ impl<'a: 'g, 'g, T> Node<'a, 'g, T> {
   }
 }
 
-/// A reference-counted entry in a linked list.
+/// A reference-counted entry in a skip list.
 ///
 /// You *must* call `release` to free this type, otherwise the node will be
 /// leaked. This is because releasing the entry requires a `Guard`.
@@ -214,15 +251,8 @@ pub struct RefNode<'a, T> {
 
 impl<'a, T> RefNode<'a, T> {
   /// Returns a reference to the parent `RawLinkedList`
-  #[inline]
-  pub const fn linked_list(&self) -> &'a RawLinkedList<T> {
+  pub fn linked_list(&self) -> &'a RawLinkedList<T> {
     self.parent
-  }
-
-  /// Returns a reference to the value of the node
-  #[inline]
-  pub const fn value(&self) -> &T {
-    unsafe { &self.node.value.assume_init_ref().value }
   }
 
   /// Releases the reference on the entry.
@@ -240,14 +270,14 @@ impl<'a, T> RefNode<'a, T> {
     unsafe { self.node.decrement_with_pin(self.parent, pin) }
   }
 
-  /// Tries to create a new `RefNode` by incrementing the reference count of
+  /// Tries to create a new `RefEntry` by incrementing the reference count of
   /// a node.
   unsafe fn try_acquire(parent: &'a RawLinkedList<T>, node: &RawNode<T>) -> Option<Self> {
     if unsafe { node.try_increment() } {
       Some(Self {
         parent,
 
-        // We re-bind the lifetime of the node here to that of the linked
+        // We re-bind the lifetime of the node here to that of the skip
         // list since we now hold a reference to it.
         node: unsafe { &*(node as *const _) },
       })
@@ -257,79 +287,12 @@ impl<'a, T> RefNode<'a, T> {
   }
 }
 
-impl<T> Clone for RefNode<'_, T> {
-  fn clone(&self) -> Self {
-    unsafe {
-      // Incrementing will always succeed since we're already holding a reference to the node.
-      RawNode::try_increment(self.node);
-    }
-    Self {
-      parent: self.parent,
-      node: self.node,
-    }
-  }
-}
-
-impl<T> fmt::Debug for RefNode<'_, T>
-where
-  T: fmt::Debug,
-{
-  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    f.debug_tuple("RefNode").field(self.value()).finish()
-  }
-}
-
-impl<'a, T> RefNode<'a, T> {
-  /// Moves to the next entry in the linked list.
-  pub fn move_next(&mut self, guard: &Guard) -> bool {
-    match self.next(guard) {
-      None => false,
-      Some(e) => {
-        mem::replace(self, e).release(guard);
-        true
-      }
-    }
-  }
-
-  /// Returns the next entry in the linked list.
-  pub fn next(&self, guard: &Guard) -> Option<RefNode<'a, T>> {
-    self.parent.checkguard(guard);
-
-    unsafe {
-      let backoff = Backoff::new();
-      loop {
-        let next = self.node.next.load_consume(guard);
-
-        if next.is_null() {
-          return None;
-        }
-
-        if next.tag() == 1 {
-          backoff.snooze();
-          continue;
-        }
-
-        let n = Node {
-          parent: self.parent,
-          node: next.deref(),
-          guard,
-        };
-
-        if let Some(e) = RefNode::try_acquire(self.parent, &n.node) {
-          return Some(e);
-        }
-      }
-    }
-  }
-}
-
 /// A lock-free linked list.
-///
-/// The linked list implementation is based on the [A Pragmatic Implementation of Non-Blocking Linked-Lists](https://www.cl.cam.ac.uk/research/srg/netos/papers/2001-caslists.pdf).
 pub struct RawLinkedList<T> {
   /// A sentinel node that is always present in the linked list
   head: RawNode<T>,
-  /// The `Collector` associated with this linked list.
+  tail: RawNode<T>,
+  /// The `Collector` associated with this skip list.
   collector: Collector,
   len: AtomicUsize,
 }
@@ -348,6 +311,7 @@ impl<T> RawLinkedList<T> {
   pub const fn new(collector: Collector) -> Self {
     Self {
       head: RawNode::<T>::UNINIT,
+      tail: RawNode::<T>::UNINIT,
       collector,
       len: AtomicUsize::new(0),
     }
@@ -441,58 +405,78 @@ impl<T> RawLinkedList<T> {
   }
 
   /// Return the first element of the linked list.
-  pub fn front(&self, g: &Guard) -> Option<RefNode<'_, T>> {
+  pub fn front<'a, 'g>(&'a self, g: &'g Guard) -> Option<Node<'a, 'g, T>> {
     let backoff = Backoff::new();
     unsafe {
       loop {
-        let node = self.head.next.load_consume(g);
+        let head_ptr = self.head.next.load_consume(g);
         // if head is being removed, wait other thread to make progress
-        if node.tag() == 1 {
+        if head_ptr.tag() == 1 {
           backoff.snooze();
           continue;
         }
 
-        if node.is_null() {
+        let head = head_ptr.deref();
+        // if the next is tail, the list is empty
+        if head.value.as_ptr().is_null() {
           return None;
         }
 
-        let n = Node {
+        return Some(Node {
           parent: self,
-          node: node.deref(),
+          node: head,
           guard: g,
-        };
+        });
+      }
+    }
+  }
 
-        if let Some(n) = RefNode::try_acquire(self, n.node) {
-          return Some(n);
+  /// Return the last element of the linked list.
+  pub fn back<'a, 'g>(&'a self, g: &'g Guard) -> Option<Node<'a, 'g, T>> {
+    let backoff = Backoff::new();
+    unsafe {
+      loop {
+        let tail_ptr = self.tail.prev.load_consume(g);
+        // if tail is being removed, wait other thread to make progress
+        if tail_ptr.tag() == 1 {
+          backoff.snooze();
+          continue;
         }
+
+        let tail = tail_ptr.deref();
+
+        // if the prev is head, the list is empty
+        if tail.value.as_ptr().is_null() {
+          return None;
+        }
+
+        return Some(Node {
+          parent: self,
+          node: tail,
+          guard: g,
+        });
       }
     }
   }
 
   /// Push a value to the front of the linked list and return the node that was pushed.
-  pub fn push(&self, value: T, g: &Guard) -> RefNode<'_, T> {
+  pub fn push_front<'a: 'g, 'g>(&'a self, value: T, g: &'g Guard) -> Node<'a, 'g, T> {
     self.checkguard(g);
     let backoff = Backoff::new();
+    let new_node = Owned::new(RawNode::new(value)).with_tag(0).into_shared(g);
+
+    // +----------------+     +------------+     +----------------+
+    // |      head      |     |    node    |     |      next      |
+    // |      next      |---->|            |     |                |
+    // |                |<----|    prev    |     |                |
+    // |                |     |    next    |---->|                |
+    // |                |     |            |<----|      prev      |
+    // +----------------+     +------------+     +----------------+
+    //
+    // 1. Initialize prev and next to point to head and next.
+    // 2. CAS head's next to repoint from next to node.
+    // 3. CAS next's prev to repoint from prev to node.
     unsafe {
-      // Rebind the guard to the lifetime of self. This is a bit of a
-      // hack but it allows us to return references that are not bound to
-      // the lifetime of the guard.
-      let g = &*(g as *const _);
-
-      // The reference count of the new node is 2, one for the node in the linked list, and one for the
-      // return RefNode.
-      let new_node = Owned::new(RawNode::new(value, 2))
-        .with_tag(0)
-        .into_shared(g);
-
-      // +----------------+     +------------+     +----------------+
-      // |      head      |     |    node    |     |      next      |
-      // |      next      |---->|            |     |                |
-      // |                |     |    next    |---->|                |
-      // +----------------+     +------------+     +----------------+
-      //
-      // 1. Initialize node's next to point to next.
-      // 2. CAS head's next to repoint from next to node.
       loop {
         // get the next node of head
         let next = self.head.next.load_consume(g);
@@ -518,18 +502,139 @@ impl<T> RawLinkedList<T> {
           continue;
         }
 
-        return RefNode {
-          parent: self,
-          node: new_node.deref(),
-        };
+        // Now, the head's next is successfully updated and points to the new node.
+        // We need to update the next's prev to the new node.
+
+        loop {}
+
+        // Ensure the next node is still valid
+        let next_node = self.head.next.load_consume(g);
+
+        if next_node != new_node {
+          // Retry if the next node is not the new node
+          backoff.spin();
+          continue;
+        }
+
+        if next_node.tag() == 1 {
+          // Retry if the next node is being removed
+          backoff.snooze();
+          continue;
+        }
+
+        let next_node = next.deref();
+
+        // CAS the next's prev to the new node
+        match next_node.prev.compare_exchange_weak(
+          Shared::null(),
+          new_node,
+          Ordering::AcqRel,
+          Ordering::Relaxed,
+          g,
+        ) {
+          Ok(_) => {
+            self.len.fetch_add(1, Ordering::Relaxed);
+            return Node {
+              parent: self,
+              node: new_node.deref(),
+              guard: g,
+            };
+          }
+          Err(_) => {
+            backoff.spin();
+          }
+        }
+      }
+    }
+  }
+
+  /// Push a value to the back of the linked list, and return the node that was pushed.
+  pub fn push_back<'a: 'g, 'g>(&'a self, value: T, g: &'g Guard) -> Node<'a, 'g, T> {
+    self.checkguard(g);
+
+    let backoff = Backoff::new();
+    let new_node = Owned::new(RawNode::new(value)).with_tag(0).into_shared(g);
+
+    // +----------------+     +------------+     +----------------+
+    // |      prev      |     |    node    |     |      tail      |
+    // |      next      |---->|            |     |                |
+    // |                |<----|    prev    |     |                |
+    // |                |     |    next    |---->|                |
+    // |                |     |            |<----|      prev      |
+    // +----------------+     +------------+     +----------------+
+    //
+    // 1. Initialize prev and next to point to tail and prev.
+    // 2. CAS tail's prev to repoint from prev to node.
+    // 3. CAS prev's next to repoint from tail to node.
+    unsafe {
+      loop {
+        // get the next node of head
+        let prev = self.tail.prev.load_consume(g);
+        let tag = prev.tag();
+        // tag is 1, this node is being removed
+        if tag == 1 {
+          // wait other thread to make progress
+          backoff.snooze();
+          continue;
+        }
+
+        // Relaxed is enough because no other thread is accessing the new node
+        new_node.deref().next.store(prev, Ordering::Relaxed);
+
+        // CAS the tail's next to the new node
+        if self
+          .tail
+          .prev
+          .compare_exchange_weak(prev, new_node, Ordering::AcqRel, Ordering::Relaxed, g)
+          .is_err()
+        {
+          backoff.spin();
+          continue;
+        }
+
+        // Ensure the next node is still valid
+        let prev_node = self.tail.prev.load_consume(g);
+
+        if prev_node != new_node {
+          // Retry if the next node is not the new node
+          backoff.spin();
+          continue;
+        }
+
+        if prev_node.tag() == 1 {
+          // Retry if the next node is being removed
+          backoff.snooze();
+          continue;
+        }
+
+        let prev_node = prev.deref();
+
+        // CAS the prev's next to the new node
+        match prev_node.next.compare_exchange_weak(
+          Shared::null(),
+          new_node,
+          Ordering::AcqRel,
+          Ordering::Relaxed,
+          g,
+        ) {
+          Ok(_) => {
+            self.len.fetch_add(1, Ordering::Relaxed);
+            return Node {
+              parent: self,
+              node: new_node.deref(),
+              guard: g,
+            };
+          }
+          Err(_) => {
+            backoff.spin();
+          }
+        }
       }
     }
   }
 
   /// Pop a value from the front of the linked list
-  ///
-  /// This operation is `O(1)`.
-  pub fn pop<'a: 'g, 'g>(&'a self, g: &'g Guard) -> Option<RefNode<'a, T>> {
+  pub fn pop_front<'a: 'g, 'g>(&'a self, g: &'g Guard) -> Option<RefNode<'a, T>> {
     self.checkguard(g);
 
     let backoff = Backoff::new();
@@ -592,10 +697,115 @@ impl<T> RawLinkedList<T> {
           )
           .is_ok()
         {
+          // Attempt to update next_next's prev pointer to head
+          if next_next
+            .deref()
+            .prev
+            .compare_exchange(next, Shared::null(), Ordering::AcqRel, Ordering::Relaxed, g)
+            .is_err()
+          {
+            // If the compare_exchange fails, retry the operation
+            backoff.snooze();
+            continue;
+          }
+
           self.len.fetch_sub(1, Ordering::Relaxed);
           let node = Node {
             parent: self,
             node: removed_next.deref(),
+            guard: g,
+          };
+
+          if let Some(nr) = node.pin() {
+            return Some(nr);
+          }
+        }
+        backoff.spin();
+      }
+    }
+  }
+
+  /// Pop a value from the back of the linked list
+  pub fn pop_back<'a: 'g, 'g>(&'a self, g: &'g Guard) -> Option<RefNode<'a, T>> {
+    self.checkguard(g);
+
+    let backoff = Backoff::new();
+
+    unsafe {
+      loop {
+        // get the prev node of tail
+        let prev = self.tail.prev.load_consume(g);
+        // tag is 1, this node is being removed
+        if prev.tag() == 1 {
+          // wait other thread to make progress
+          backoff.snooze();
+          continue;
+        }
+
+        // if prev is null, the list is empty
+        if prev.is_null() {
+          return None;
+        }
+
+        // mark the prev node as being removed
+        let removed_prev = prev.with_tag(1);
+        if self
+          .tail
+          .prev
+          .compare_exchange_weak(prev, removed_prev, Ordering::AcqRel, Ordering::Relaxed, g)
+          .is_err()
+        {
+          // other thread operated the next node, wait other thread to make progress
+          backoff.snooze();
+          continue;
+        }
+
+        // Revalidate prev after marking it as removed
+        let reloaded_prev = self.tail.prev.load_consume(g);
+        if reloaded_prev != removed_prev {
+          backoff.snooze();
+          continue;
+        }
+
+        let prev_prev = prev.deref().prev.load_consume(g);
+        if prev_prev.tag() == 1 {
+          // wait other thread to make progress
+          backoff.snooze();
+          continue;
+        }
+
+        // we have marked the prev node as being removed, now, let's try to make the tail.prev
+        // point to the prev prev node
+
+        // CAS the prev's prev points to the prev prev node
+        if self
+          .tail
+          .prev
+          .compare_exchange_weak(
+            removed_prev,
+            prev_prev,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+            g,
+          )
+          .is_ok()
+        {
+          // Attempt to update next_next's prev pointer to head
+          if prev_prev
+            .deref()
+            .prev
+            .compare_exchange(prev, Shared::null(), Ordering::AcqRel, Ordering::Relaxed, g)
+            .is_err()
+          {
+            // If the compare_exchange fails, retry the operation
+            backoff.snooze();
+            continue;
+          }
+
+          self.len.fetch_sub(1, Ordering::Relaxed);
+          let node = Node {
+            parent: self,
+            node: removed_prev.deref(),
             guard: g,
           };
 
@@ -614,8 +824,6 @@ impl<T> RawLinkedList<T> {
       assert!(c == &self.collector);
     }
   }
-
-  // fn help_unlink(&self, )
 }
 
 impl<T: PartialEq> RawLinkedList<T> {
@@ -658,7 +866,7 @@ impl<T> Drop for RawLinkedList<T> {
         .next
         .load(Ordering::Relaxed, crossbeam_epoch::unprotected());
 
-      // Iterate through the whole linked list and destroy every node.
+      // Iterate through the whole skip list and destroy every node.
       loop {
         // list is empty
         if node.is_null() {
@@ -678,19 +886,6 @@ impl<T> Drop for RawLinkedList<T> {
 
         node = next;
       }
-    }
-  }
-}
-
-/// Helper function to retry an operation until pinning succeeds or `None` is
-/// returned.
-pub(super) fn try_pin_loop<'a: 'g, 'g, F, T>(mut f: F) -> Option<RefNode<'a, T>>
-where
-  F: FnMut() -> Option<Node<'a, 'g, T>>,
-{
-  loop {
-    if let Some(e) = f()?.pin() {
-      return Some(e);
     }
   }
 }
